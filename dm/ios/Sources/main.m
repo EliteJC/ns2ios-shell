@@ -1,12 +1,17 @@
 // iOS App entry: set the environment (game files, saves, shader libraries), write the host log to Documents/log.txt, create the window (front_ios.m), then run the host's dm_main on a big-stack thread.
-// The game files (RomFS) ship inside the App at <App>/romfs; Documents/romfs.img (one image, scripts/push_romfs.sh; its name in any letter case) or a Documents/romfs folder is also accepted (lets you swap them without reinstalling). The DLC folder aoc/ likewise: Documents/aoc, else <App>/aoc.
+// The game files (RomFS) ship inside the App at <App>/romfs; Documents/romfs.img (one image, scripts/push_romfs.sh; its name in any letter case) or a Documents/romfs folder is also accepted (lets you swap them without reinstalling).
 #import <UIKit/UIKit.h>
 #import <Metal/Metal.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 #include <os/proc.h>          // os_proc_available_memory: the line at boot saying whether the memory entitlement took effect
 #include "game_profile.h"   // game profile constants (the RomFS marker path)
@@ -19,6 +24,79 @@
 #endif
 
 extern char **environ;
+
+// ---- DM_LOG_STAMP begin
+// Timing build: every line of log.txt gets "[+SSS.mmm] " in front: the seconds since this process was created, the same zero point as the
+// [bootprof] and [longframe] times. The host writes its log to stderr; stderr is pointed at a pipe, and a thread stamps each line as it
+// arrives and writes it to the real log file. A line is stamped when the thread reads it, a fraction of a millisecond to a few ms after it was
+// written. If the app is killed, the last lines still in the pipe can be missing.
+static FILE *g_stamp_out;
+static double g_stamp_age0;            // the process's age when the stamping began
+static struct timespec g_stamp_t0;     // the monotonic clock at that moment
+
+static double dm_stamp_proc_age(void) {
+#if defined(__APPLE__)
+    struct kinfo_proc kp; size_t n = sizeof kp; int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
+    struct timeval tv; gettimeofday(&tv, NULL);
+    if (sysctl(mib, 4, &kp, &n, NULL, 0) || !n) return 0;
+    double age = (double)(tv.tv_sec - kp.kp_proc.p_starttime.tv_sec) + (double)(tv.tv_usec - kp.kp_proc.p_starttime.tv_usec) / 1e6;
+    return age > 0 ? age : 0;
+#else
+    return 0;
+#endif
+}
+
+static double dm_stamp_now(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return g_stamp_age0 + (double)(t.tv_sec - g_stamp_t0.tv_sec) + (double)(t.tv_nsec - g_stamp_t0.tv_nsec) / 1e9;
+}
+
+static void *dm_stamp_thread(void *arg) {
+    int rfd = (int)(intptr_t)arg;
+    static char buf[16384];
+    size_t n = 0;
+    for (;;) {
+        ssize_t r = read(rfd, buf + n, sizeof buf - n - 1);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        double s = dm_stamp_now();
+        n += (size_t)r;
+        char *p = buf, *nl;
+        while ((nl = memchr(p, '\n', (size_t)(buf + n - p)))) {
+            fprintf(g_stamp_out, "[+%8.3f] %.*s\n", s, (int)(nl - p), p);
+            p = nl + 1;
+        }
+        n = (size_t)(buf + n - p);
+        memmove(buf, p, n);
+        if (n >= sizeof buf - 1) { fprintf(g_stamp_out, "[+%8.3f] %.*s\n", s, (int)n, buf); n = 0; }
+        fflush(g_stamp_out);
+    }
+    return NULL;
+}
+
+static void dm_log_stamp_start(void) {
+    fflush(stderr);
+    int out_fd = dup(fileno(stderr));
+    if (out_fd < 0) return;
+    int p[2];
+    if (pipe(p)) { close(out_fd); return; }
+    FILE *out = fdopen(out_fd, "w");
+    if (!out) { close(out_fd); close(p[0]); close(p[1]); return; }
+    if (dup2(p[1], fileno(stderr)) < 0) { fclose(out); close(p[0]); close(p[1]); return; }
+    close(p[1]);
+    g_stamp_out = out;
+    g_stamp_age0 = dm_stamp_proc_age();
+    clock_gettime(CLOCK_MONOTONIC, &g_stamp_t0);
+    struct timeval tv; gettimeofday(&tv, NULL); struct tm tmv; time_t sec = tv.tv_sec; localtime_r(&sec, &tmv);
+    fprintf(out, "[+%8.3f] log timestamps on: seconds since the process was created; this line was written at %02d:%02d:%02d.%03d local time\n",
+            g_stamp_age0, tmv.tm_hour, tmv.tm_min, tmv.tm_sec, (int)(tv.tv_usec / 1000));
+    fflush(out);
+    pthread_t th;
+    if (pthread_create(&th, NULL, dm_stamp_thread, (void *)(intptr_t)p[0]) == 0) { pthread_detach(th); setvbuf(stderr, NULL, _IOLBF, 0); return; }
+    dup2(out_fd, fileno(stderr));      // no thread: give stderr back to the file, or the full pipe would block the host
+    close(p[0]);
+}
+// ---- DM_LOG_STAMP end
 
 int dm_main(int argc, char **argv);   // dm/host/main.c compiled in with -Dmain=dm_main
 #ifdef DM_SHELL
@@ -90,38 +168,14 @@ static NSString *romfs_locate(void) {
     return nil;
 }
 
-// Add-on content (DLC): each DLC's RomFS image at <dir>/<index>.img (or a legacy <index>/ folder). Like the game files, Documents/aoc comes before <App>/aoc.
-// A DM_AOC_DIR that is already set (env.txt, the launch environment) wins. The host mounts and counts the DLC from DM_AOC_DIR (hle_fs.c, hle_misc.c)
-static void aoc_locate(void) {
-    if (getenv("DM_AOC_DIR")) return;
-    NSFileManager *fm = NSFileManager.defaultManager;
-    NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
-    for (NSString *d in @[[doc stringByAppendingPathComponent:@"aoc"], [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"aoc"]]) {
-        BOOL dir = NO;
-        if (![fm fileExistsAtPath:d isDirectory:&dir] || !dir) continue;
-        setenv("DM_AOC_DIR", d.fileSystemRepresentation, 0);
-        fprintf(stderr, "boot: DLC from %s\n", d.fileSystemRepresentation);
-        return;
-    }
-}
-
 // Boot prerequisites (done before UIApplicationMain): directories / environment variables / log -- the host's early load reads these
 // Why a slim build found no usable game files: the verdict on Documents/romfs.img (the first of romfs_document_images), in the log and for the screen (front_ios_boot_message). NULL when the build has no romfs.id
 static char g_boot_message[640];
 const char *front_ios_boot_message(void) { return g_boot_message[0] ? g_boot_message : NULL; }
 // Why this device cannot run the games: its GPU has no BC texture formats, which the games' textures use and the host does not decompress (dm/gfx/tex/README.md; the A16 and older,
-// GitHub issue #704), so the screen says so instead of Metal aborting at the game's first BC texture. NULL on a supported device. Called by startGame (front_ios.m) once the launcher has set
-// its switches: this makes the process's first Metal device, and Metal reads MTL_HUD_ENABLED then; checked at launch, it kept the launcher's Performance HUD off (GitHub issue #840)
-const char *front_ios_device_check(void) {
-    static char msg[320]; static int done;
-    if (done++) return msg[0] ? msg : NULL;
-    id<MTLDevice> gpu = MTLCreateSystemDefaultDevice();   // the system default device, the one the graphics layers take (mtl_init repeats this check for the other routes)
-    if (gpu.supportsBCTextureCompression) return NULL;
-    snprintf(msg, sizeof msg, "This device's GPU (%s) cannot read BC-compressed textures, which the games use. It needs an iPhone 15 Pro or newer (A17 Pro chip or later) or an iPad with an M1 chip or later.",
-             gpu ? gpu.name.UTF8String : "no Metal device");
-    fprintf(stderr, "[RED] boot: %s\n", msg);
-    return msg;
-}
+// GitHub issue #704). Checked before the host's early loading, so the screen says so instead of Metal aborting at the game's first BC texture. NULL on a supported device
+static char g_device_message[320];
+const char *front_ios_device_message(void) { return g_device_message[0] ? g_device_message : NULL; }
 static void romfs_identity_report(NSString *doc) {
     romfs_id want, got;
     int rc = romfs_id_check([NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"romfs.id"].fileSystemRepresentation,
@@ -137,14 +191,14 @@ static int boot_env(void) {
     NSString *res = NSBundle.mainBundle.resourcePath;
     for (NSString *d in @[@"save", @"temp", @"cheats"]) [fm createDirectoryAtPath:[doc stringByAppendingPathComponent:d] withIntermediateDirectories:YES attributes:nil error:nil];
     // Keep game files and scratch data out of device backups (Documents is backed up by default; a RomFS placed there is many GB). Saves, logs and the pipeline list stay in the backup
-    for (NSString *d in [@[@"romfs", @"aoc", @"temp"] arrayByAddingObjectsFromArray:[romfs_document_images(doc) valueForKey:@"lastPathComponent"]]) {
+    for (NSString *d in [@[@"romfs", @"temp"] arrayByAddingObjectsFromArray:[romfs_document_images(doc) valueForKey:@"lastPathComponent"]]) {
         NSURL *u = [NSURL fileURLWithPath:[doc stringByAppendingPathComponent:d]]; NSError *e = nil;
         if ([fm fileExistsAtPath:u.path] && ![u setResourceValue:@YES forKey:NSURLIsExcludedFromBackupKey error:&e]) fprintf(stderr, "boot: %s could not be excluded from backup: %s\n", d.UTF8String, e.localizedDescription.UTF8String);
     }
     // Log: the host only writes to stderr; redirect it to Documents/log.txt (the previous one is kept as log.prev.txt), retrieve it from the Files app when something goes wrong
     NSString *log = [doc stringByAppendingPathComponent:@"log.txt"], *prev = [doc stringByAppendingPathComponent:@"log.prev.txt"];
     [fm removeItemAtPath:prev error:nil]; [fm moveItemAtPath:log toPath:prev error:nil];
-    if (freopen(log.fileSystemRepresentation, "w", stderr)) setvbuf(stderr, NULL, _IOLBF, 0);
+    if (freopen(log.fileSystemRepresentation, "w", stderr)) { setvbuf(stderr, NULL, _IOLBF, 0); dm_log_stamp_start(); }   // timing build: every line is stamped
     // Environment switch files (for on-device diagnostics: a sideloaded app cannot be given environment variables from outside): one KEY=VALUE per line, # starts a comment; Documents/env.txt takes precedence over dm/env.txt in the bundle (put there by build_ipa.sh's DM_ENV_FILE)
     NSMutableArray<NSString *> *from_file = [NSMutableArray array], *from_launch = [NSMutableArray array];
     for (char **e = environ; *e; e++) {   // set at launch (Xcode, devicectl): before the env files, and the launcher keeps them
@@ -174,7 +228,7 @@ static int boot_env(void) {
     }
     setenv("DM_ENV_FILE_KEYS", [from_file componentsJoinedByString:@" "].UTF8String, 1);   // the launcher keeps what an env file set (LauncherSettings.swift)
     setenv("DM_ENV_LAUNCH_KEYS", [from_launch componentsJoinedByString:@" "].UTF8String, 1);   // and what the launch environment set (docs/frontends.md, Saved choices)
-    front_hud_env();   // an env file's DM_METAL_HUD; nothing in this process makes a Metal device before startGame (front_ios.m), which applies the launcher's
+    front_hud_env();   // before the early loading below can make a device
     // Game language (nn::oe::GetDesiredLanguage, hle_oe.c): the one the IPA was packed with (the NSP script's LANGUAGE / --language → DMLanguage in Info.plist), unless an env file sets DM_LANG
     // (or the launcher, which replaces this default before the game starts)
     NSString *lang = [NSBundle.mainBundle objectForInfoDictionaryKey:@"DMLanguage"];
@@ -187,6 +241,12 @@ static int boot_env(void) {
       fprintf(stderr, "boot: memory limit %llu MB (%s)\n", av >> 20,
               av < (5ull << 30) ? "no increased-memory-limit entitlement: the bigger games will be killed for memory"
                                 : "entitlement in effect"); }
+    id<MTLDevice> gpu = MTLCreateSystemDefaultDevice();   // the system default device, the one the graphics layers take (mtl_init repeats this check for the other routes)
+    if (!gpu.supportsBCTextureCompression) {
+        snprintf(g_device_message, sizeof g_device_message, "This device's GPU (%s) cannot read BC-compressed textures, which the games use. It needs an iPhone 15 Pro or newer (A17 Pro chip or later) or an iPad with an M1 chip or later.",
+                 gpu ? gpu.name.UTF8String : "no Metal device");
+        fprintf(stderr, "[RED] boot: %s\n", g_device_message); return 0;
+    }
     NSString *romfs = romfs_locate();
     if (!romfs) { romfs_identity_report(doc); fprintf(stderr, "boot: game files not found (Documents/romfs.img, Documents/romfs or <App>/romfs)\n"); return 0; }
     fprintf(stderr, "boot: game files %s\n", romfs.fileSystemRepresentation);
@@ -200,14 +260,12 @@ static int boot_env(void) {
     // The host loads at launch, before the settings screen exists, so the cheat load waits for Play (front_ios.m calls
     // dm_cheats_after_launcher): otherwise it would only log "no file for build" and never see the panel's file.
     setenv("DM_CHEATS_DEFER", "1", 1);
-    // The panel is the only switch there is on a phone, so it owns every entry -- including a "{Name}" master, which
-    // Atmosphère always runs: with no menu to turn one off, a file whose master breaks the game would be unusable.
-    setenv("DM_CHEATS_PANEL", "1", 1);
     NSString *dm = [res stringByAppendingPathComponent:@"dm"];
     setenv("DM_NVN_SHMAP", [dm stringByAppendingPathComponent:@"shader_map.tsv"].fileSystemRepresentation, 0);
     setenv("DM_MSL_DIR", [res stringByAppendingPathComponent:@"msl"].fileSystemRepresentation, 0);
     setenv("DM_FONT_DIR", [dm stringByAppendingPathComponent:@"font"].fileSystemRepresentation, 0);   // Shared-font stand-ins (standard.ttf / nintendo_ext.ttf): iOS lacks the macOS font path
-    aoc_locate();   // add-on content: Documents/aoc, else <App>/aoc; an empty Documents/aoc explicitly selects no DLC
+    NSString *aoc = [res stringByAppendingPathComponent:@"aoc"];   // add-on content: build_ipa.sh puts the RomFS extracted from the player's DLC NSPs at <App>/aoc/<index>/
+    if ([fm fileExistsAtPath:aoc]) setenv("DM_AOC_DIR", aoc.fileSystemRepresentation, 0);
     NSString *pso = [res stringByAppendingPathComponent:@"pso"];   // the pipeline archive made offline (build_ipa.sh, dm/gfx/tools/pso_offline.py): the shader pairs' bases, which the device then does not build
     if ([fm fileExistsAtPath:pso]) setenv("DM_PSO_BUNDLE", pso.fileSystemRepresentation, 0);
     chdir(doc.fileSystemRepresentation);
